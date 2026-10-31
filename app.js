@@ -267,28 +267,129 @@
 	// Commune search (geo.api.gouv.fr)
 	// ---------------------------------------------------------------------------------------------
 	const COMMUNE_FIELDS = "nom,code,codesPostaux,departement";
+	// Fallback when geo.api.gouv.fr is down or too slow: IGN Géoplateforme WFS (BD TOPO communes)
+	const IGN_WFS = "https://data.geopf.fr/wfs/ows";
+	const IGN_COMMUNES_LAYER = "BDTOPO_V3:commune";
+	const GEO_API_TIMEOUT_MS = 8000;
+	const IGN_TIMEOUT_MS = 30000;
+	let geoApiDown = false; // once geo.api.gouv.fr failed, go straight to IGN for the rest of the session
+
+	async function fetchJsonWithTimeout(url, ms) {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), ms);
+		try {
+			return await fetchJson(url, controller.signal);
+		}
+		catch(err) {
+			if(err.name === "AbortError") { throw new Error(`pas de réponse après ${ms / 1000} s (${url})`); }
+			throw err;
+		}
+		finally {
+			clearTimeout(timer);
+		}
+	}
+
+	const isCommuneCode = q => /^\d[\dAB]\d{3}$/i.test(q);
+
+	async function searchCommunesGeoApi(q) {
+		const get = url => fetchJsonWithTimeout(url, GEO_API_TIMEOUT_MS);
+		if(isCommuneCode(q)) {
+			// 5 chars: either a postal code or an INSEE code
+			const [byPostal, byInsee] = await Promise.allSettled([
+				get(`${GEO_API}/communes?codePostal=${encodeURIComponent(q)}&fields=${COMMUNE_FIELDS}`),
+				get(`${GEO_API}/communes?code=${encodeURIComponent(q.toUpperCase())}&fields=${COMMUNE_FIELDS}`),
+			]);
+			if(byPostal.status === "rejected" && byInsee.status === "rejected") { throw byInsee.reason; }
+			const seen = new Set();
+			return [...(byInsee.value || []), ...(byPostal.value || [])].filter(c => !seen.has(c.code) && seen.add(c.code));
+		}
+		return get(`${GEO_API}/communes?nom=${encodeURIComponent(q)}&fields=${COMMUNE_FIELDS}&boost=population&limit=10`);
+	}
+
+	function ignWfsUrl(params) {
+		return `${IGN_WFS}?${new URLSearchParams({
+			service: "WFS",
+			version: "2.0.0",
+			request: "GetFeature",
+			typeNames: IGN_COMMUNES_LAYER,
+			outputFormat: "application/json",
+			srsName: "EPSG:4326",
+			...params,
+		})}`;
+	}
+
+	/** Makes sure coordinates are [lon, lat] (WFS 2.0 may return EPSG:4326 as [lat, lon]) */
+	function lonLatGeometry(geom) {
+		const polygons = geom.type === "Polygon" ? [geom.coordinates] : geom.coordinates;
+		const [a, b] = polygons[0][0][0];
+		// Metropolitan France: lon in [-6, 10], lat in [41, 52]
+		const swapped = a >= 41 && a <= 52 && b >= -6 && b <= 10;
+		if(!swapped) { return geom; }
+		const swap = rings => rings.map(ring => ring.map(([x, y, ...rest]) => [y, x, ...rest]));
+		return geom.type === "Polygon"
+			? { type: "Polygon", coordinates: swap(geom.coordinates) }
+			: { type: "MultiPolygon", coordinates: geom.coordinates.map(swap) };
+	}
+
+	function ignFeatureToCommune(f) {
+		const p = f.properties || {};
+		return {
+			nom: p.nom_officiel,
+			code: p.code_insee,
+			codesPostaux: [],
+			departement: p.code_insee_du_departement ? { code: p.code_insee_du_departement, nom: "" } : null,
+			contour: f.geometry ? lonLatGeometry(f.geometry) : undefined,
+		};
+	}
+
+	async function searchCommunesIgn(q) {
+		const filter = isCommuneCode(q) ? `code_insee=${cqlQuote(q.toUpperCase())}` : `nom_officiel ILIKE ${cqlQuote(`${q}%`)}`;
+		const data = await fetchJsonWithTimeout(ignWfsUrl({
+			CQL_FILTER: filter,
+			count: "10",
+			propertyName: "nom_officiel,code_insee,code_insee_du_departement",
+		}), IGN_TIMEOUT_MS);
+		return (data.features || []).map(ignFeatureToCommune);
+	}
+
+	async function loadCommuneIgn(code) {
+		const data = await fetchJsonWithTimeout(ignWfsUrl({ CQL_FILTER: `code_insee=${cqlQuote(code)}`, count: "1" }), IGN_TIMEOUT_MS);
+		const feature = (data.features || [])[0];
+		if(!feature) { throw new Error(`commune ${code} introuvable`); }
+		return ignFeatureToCommune(feature);
+	}
+
+	/** Tries geo.api.gouv.fr first, then IGN Géoplateforme if it fails */
+	async function withCommuneFallback(fromGeoApi, fromIgn) {
+		if(!geoApiDown) {
+			try {
+				return await fromGeoApi();
+			}
+			catch(err) {
+				if(err.status && err.status < 500) { throw err; } // genuine answer (e.g. unknown commune)
+				console.warn("geo.api.gouv.fr indisponible, utilisation de la Géoplateforme IGN :", err);
+				geoApiDown = true;
+			}
+		}
+		return fromIgn();
+	}
 
 	async function searchCommunes(query) {
 		const q = query.trim();
 		if(q.length < 2) { return []; }
-		if(/^\d[\dAB]\d{3}$/i.test(q)) {
-			// 5 chars: either a postal code or an INSEE code
-			const [byPostal, byInsee] = await Promise.all([
-				fetchJson(`${GEO_API}/communes?codePostal=${encodeURIComponent(q)}&fields=${COMMUNE_FIELDS}`).catch(() => []),
-				fetchJson(`${GEO_API}/communes?code=${encodeURIComponent(q.toUpperCase())}&fields=${COMMUNE_FIELDS}`).catch(() => []),
-			]);
-			const seen = new Set();
-			return [...byInsee, ...byPostal].filter(c => !seen.has(c.code) && seen.add(c.code));
-		}
-		return fetchJson(`${GEO_API}/communes?nom=${encodeURIComponent(q)}&fields=${COMMUNE_FIELDS}&boost=population&limit=10`);
+		return withCommuneFallback(() => searchCommunesGeoApi(q), () => searchCommunesIgn(q));
 	}
 
 	async function loadCommune(code) {
-		return fetchJson(`${GEO_API}/communes/${encodeURIComponent(code)}?fields=${COMMUNE_FIELDS},contour`);
+		return withCommuneFallback(
+			() => fetchJsonWithTimeout(`${GEO_API}/communes/${encodeURIComponent(code)}?fields=${COMMUNE_FIELDS},contour`, GEO_API_TIMEOUT_MS),
+			() => loadCommuneIgn(code)
+		);
 	}
 
 	function communeLabel(c) {
-		const dep = c.departement ? `${c.departement.nom} (${c.departement.code})` : "";
+		const d = c.departement;
+		const dep = d ? (d.nom ? `${d.nom} (${d.code})` : `dép. ${d.code}`) : "";
 		return `${c.nom}${dep ? ` – ${dep}` : ""}`;
 	}
 

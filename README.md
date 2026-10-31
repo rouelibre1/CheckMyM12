@@ -29,7 +29,10 @@ Le tag recherché est modifiable dans « Tag recherché » (plusieurs valeurs po
 
 ## Fonctionnement
 
-- Contour de la commune : [geo.api.gouv.fr](https://geo.api.gouv.fr).
+- Recherche et contour de la commune : [geo.api.gouv.fr](https://geo.api.gouv.fr). S'il ne répond pas
+  (erreur ou plus de 8 s), l'outil bascule sur la Géoplateforme IGN (WFS `BDTOPO_V3:commune` sur
+  `data.geopf.fr`) pour le reste de la session. En secours, la recherche se fait par nom ou code INSEE
+  (pas par code postal).
 - Recherche : `GET /api/search?bbox=…&filter="semantics.osm|traffic_sign"='FR:M12'`.
   Ce filtre renvoie aussi les images dont le tag n'est présent que sur une annotation : l'outil ne garde
   que celles où le tag est dans `properties.semantics` (image) et dans aucune `properties.annotations[].semantics`.
