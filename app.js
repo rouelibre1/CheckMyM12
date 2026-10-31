@@ -417,9 +417,16 @@
 		});
 	}
 
-	/** Server errors (timeouts show up as HTTP 500) or gateway errors without CORS headers (TypeError) */
+	/**
+	 * Errors worth retrying on smaller areas: server errors (timeouts show up as HTTP 500/504), rate limiting,
+	 * and network failures (gateway errors without CORS headers, connection reset, response cut while reading…),
+	 * which browsers report as TypeError ("Failed to fetch", "NetworkError when attempting to fetch resource")
+	 * or as a JSON parsing error on a truncated body.
+	 */
 	function isServerError(err) {
-		return (err.status && err.status >= 500) || err.name === "TypeError";
+		if(err.name === "AbortError") { return false; }
+		if(err.status) { return err.status >= 500 || err.status === 429; }
+		return true;
 	}
 
 	async function searchPictures(apiBase, contour, filter, signal, onProgress) {
