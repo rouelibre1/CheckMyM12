@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>CheckMyM12 – panonceaux M12 sans zone sur Panoramax</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+<body>
+	<header>
+		<h1>CheckMyM12</h1>
+		<p class="intro">
+			Liste des images Panoramax portant le tag <code>osm|traffic_sign=FR:M12</code> au niveau de l'image,
+			sans annotation (zone) indiquant l'emplacement du panonceau.
+		</p>
+	</header>
+
+	<form id="search-form" autocomplete="off">
+		<div class="field commune-field">
+			<label for="commune-input">Commune</label>
+			<input id="commune-input" type="text" placeholder="Nom, code postal ou code INSEE" required>
+			<ul id="commune-suggestions" class="suggestions" hidden></ul>
+			<small id="commune-selected" class="hint"></small>
+		</div>
+
+		<div class="field">
+			<label for="source-select">Source</label>
+			<select id="source-select">
+				<option value="https://api.panoramax.xyz/api">Toutes les instances (méta-catalogue api.panoramax.xyz)</option>
+				<option value="https://panoramax.openstreetmap.fr/api">panoramax.openstreetmap.fr</option>
+				<option value="https://panoramax.ign.fr/api">panoramax.ign.fr</option>
+				<option value="custom">Autre instance…</option>
+			</select>
+			<input id="source-custom" type="url" placeholder="https://mon-instance.fr/api" hidden>
+		</div>
+
+		<details class="field advanced">
+			<summary>Tag recherché</summary>
+			<label for="tag-key">Clé</label>
+			<input id="tag-key" type="text" value="osm|traffic_sign">
+			<label for="tag-values">Valeur(s), séparées par des virgules</label>
+			<input id="tag-values" type="text" value="FR:M12">
+		</details>
+
+		<div class="actions">
+			<button id="search-btn" type="submit">Rechercher</button>
+			<button id="cancel-btn" type="button" hidden>Annuler</button>
+		</div>
+	</form>
+
+	<section id="status" aria-live="polite"></section>
+
+	<section id="results" hidden>
+		<div class="toolbar">
+			<span id="counters"></span>
+			<label><input id="hide-done" type="checkbox" checked> Masquer les images traitées</label>
+			<button id="recheck-all-btn" type="button">Revérifier toutes les images</button>
+			<button id="export-btn" type="button">Exporter (CSV)</button>
+		</div>
+		<ol id="task-list"></ol>
+	</section>
+
+	<footer>
+		Données : <a href="https://panoramax.fr" target="_blank" rel="noopener">Panoramax</a> ·
+		Contours des communes : <a href="https://geo.api.gouv.fr" target="_blank" rel="noopener">geo.api.gouv.fr</a>
+	</footer>
+
+	<script src="app.js"></script>
+</body>
+</html>
