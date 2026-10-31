@@ -33,7 +33,12 @@ Le tag recherché est modifiable dans « Tag recherché » (plusieurs valeurs po
 - Recherche : `GET /api/search?bbox=…&filter="semantics.osm|traffic_sign"='FR:M12'`.
   Ce filtre renvoie aussi les images dont le tag n'est présent que sur une annotation : l'outil ne garde
   que celles où le tag est dans `properties.semantics` (image) et dans aucune `properties.annotations[].semantics`.
-- `/api/search` n'est pas paginé : si une requête renvoie le maximum de résultats (1000), l'emprise est
+- La commune est interrogée par cases d'environ 0,03° (≈ 2,5 km), en ne gardant que les cases qui touchent
+  son contour : sur certaines instances (ex. `panoramax.ign.fr`), une recherche par tag sur une grande zone
+  dense dépasse le délai du serveur et renvoie une erreur HTTP 500.
+- Si une case renvoie une erreur serveur, elle est redécoupée en 4 (jusqu'à 2 fois). Les zones qui échouent
+  encore sont signalées (liste possiblement incomplète) ; si rien ne répond, la recherche s'arrête avec l'erreur.
+- `/api/search` n'est pas paginé : si une requête renvoie le maximum de résultats (1000), la case est
   découpée en 4 et chaque quart est interrogé à nouveau.
 - Les images situées dans l'emprise mais hors du contour de la commune sont écartées.
 - Le méta-catalogue peut avoir un léger retard sur les instances ; « Revérifier » interroge directement

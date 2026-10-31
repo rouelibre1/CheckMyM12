@@ -20,6 +20,12 @@
 	const GEO_API = "https://geo.api.gouv.fr";
 	const SEARCH_LIMIT = 1000;
 	const MAX_SPLIT_DEPTH = 7;
+	// Some instances time out (HTTP 500 after 30 s) on semantic searches over dense, large areas:
+	// the commune is queried as a grid of small cells, and a failing cell is split again.
+	const INITIAL_CELL_SIZE_DEG = 0.03;
+	const MAX_ERROR_SPLIT_DEPTH = 2;
+	// Give up when areas still fail at the finest split level and nothing has succeeded (server down, not just slow)
+	const MAX_FAILED_AREAS_WITHOUT_SUCCESS = 4;
 	const MAX_PARALLEL_REQUESTS = 4;
 	const DONE_STORAGE_KEY = "checkmym12:done";
 
@@ -196,6 +202,56 @@
 		return polygons.some(([outer, ...holes]) => pointInRing(point, outer) && !holes.some(h => pointInRing(point, h)));
 	}
 
+	/** Liang–Barsky: does segment [a, b] cross rectangle [minx, miny, maxx, maxy]? */
+	function segmentIntersectsRect([x1, y1], [x2, y2], [minx, miny, maxx, maxy]) {
+		const dx = x2 - x1, dy = y2 - y1;
+		const p = [-dx, dx, -dy, dy];
+		const q = [x1 - minx, maxx - x1, y1 - miny, maxy - y1];
+		let t0 = 0, t1 = 1;
+		for(let i = 0; i < 4; i++) {
+			if(p[i] === 0) {
+				if(q[i] < 0) { return false; }
+			}
+			else {
+				const t = q[i] / p[i];
+				if(p[i] < 0) { t0 = Math.max(t0, t); }
+				else { t1 = Math.min(t1, t); }
+				if(t0 > t1) { return false; }
+			}
+		}
+		return true;
+	}
+
+	function rectIntersectsGeometry(rect, geom) {
+		const [minx, miny, maxx, maxy] = rect;
+		if(pointInGeometry([(minx + maxx) / 2, (miny + maxy) / 2], geom)) { return true; }
+		const polygons = geom.type === "Polygon" ? [geom.coordinates] : geom.coordinates;
+		return polygons.some(rings => rings.some(ring =>
+			ring.some((pt, i) => i > 0 && segmentIntersectsRect(ring[i - 1], pt, rect))
+		));
+	}
+
+	/** Splits bbox in a grid of cells of at most `size` degrees, keeping only cells touching the geometry */
+	function gridCells([minx, miny, maxx, maxy], size, geom) {
+		const nx = Math.max(1, Math.ceil((maxx - minx) / size));
+		const ny = Math.max(1, Math.ceil((maxy - miny) / size));
+		const w = (maxx - minx) / nx;
+		const h = (maxy - miny) / ny;
+		const cells = [];
+		for(let i = 0; i < nx; i++) {
+			for(let j = 0; j < ny; j++) {
+				const cell = [
+					minx + i * w,
+					miny + j * h,
+					i === nx - 1 ? maxx : minx + (i + 1) * w,
+					j === ny - 1 ? maxy : miny + (j + 1) * h,
+				];
+				if(rectIntersectsGeometry(cell, geom)) { cells.push(cell); }
+			}
+		}
+		return cells;
+	}
+
 	function splitBbox([minx, miny, maxx, maxy]) {
 		const mx = (minx + maxx) / 2;
 		const my = (miny + maxy) / 2;
@@ -338,51 +394,105 @@
 	// Panoramax search
 	// ---------------------------------------------------------------------------------------------
 
-	/** Small concurrency limiter */
+	/** Small concurrency limiter: tasks with the highest priority run first (FIFO among equals) */
 	function limiter(max) {
 		let running = 0;
 		const queue = [];
 		const next = () => {
 			if(running >= max || !queue.length) { return; }
 			running++;
-			const { fn, resolve, reject } = queue.shift();
+			let best = 0;
+			for(let i = 1; i < queue.length; i++) {
+				if(queue[i].priority > queue[best].priority) { best = i; }
+			}
+			const { fn, resolve, reject } = queue.splice(best, 1)[0];
 			fn().then(resolve, reject).finally(() => {
 				running--;
 				next();
 			});
 		};
-		return fn => new Promise((resolve, reject) => {
-			queue.push({ fn, resolve, reject });
+		return (fn, priority = 0) => new Promise((resolve, reject) => {
+			queue.push({ fn, priority, resolve, reject });
 			next();
 		});
 	}
 
-	async function searchPictures(apiBase, bbox, filter, signal, onProgress) {
+	/** Server errors (timeouts show up as HTTP 500) or gateway errors without CORS headers (TypeError) */
+	function isServerError(err) {
+		return (err.status && err.status >= 500) || err.name === "TypeError";
+	}
+
+	async function searchPictures(apiBase, contour, filter, signal, onProgress) {
 		const run = limiter(MAX_PARALLEL_REQUESTS);
 		const found = new Map();
-		const stats = { requests: 0, truncated: false };
+		const stats = { requests: 0, successes: 0, errors: 0, truncated: false, errorSplits: 0, failedAreas: 0, lastError: null };
+		const progress = () => onProgress(found.size, stats);
+		// Aborted either by the user (cancel) or when the server is considered down
+		const abortAll = new AbortController();
+		signal.addEventListener("abort", () => abortAll.abort());
+		let serverDown = false;
 
-		async function searchArea(area, depth) {
+		async function searchArea(area, depth, errorDepth) {
 			const params = new URLSearchParams({
 				bbox: area.map(n => n.toFixed(7)).join(","),
 				limit: String(SEARCH_LIMIT),
 				filter,
 			});
-			const data = await run(() => fetchJson(`${apiBase}/search?${params}`, signal));
+			let data;
+			try {
+				// Deeper (smaller) areas first: a failing area is explored down before moving on to the next one
+				data = await run(() => fetchJson(`${apiBase}/search?${params}`, abortAll.signal), depth);
+			}
+			catch(err) {
+				if(!isServerError(err)) { throw err; }
+				stats.requests++;
+				stats.errors++;
+				stats.lastError = err;
+				if(errorDepth < MAX_ERROR_SPLIT_DEPTH) {
+					stats.errorSplits++;
+					progress();
+					const subs = splitBbox(area).filter(sub => rectIntersectsGeometry(sub, contour));
+					await Promise.all(subs.map(sub => searchArea(sub, depth + 1, errorDepth + 1)));
+				}
+				else {
+					stats.failedAreas++;
+					if(stats.successes === 0 && stats.failedAreas >= MAX_FAILED_AREAS_WITHOUT_SUCCESS) {
+						serverDown = true;
+						abortAll.abort();
+						throw err;
+					}
+					progress();
+				}
+				return;
+			}
 			stats.requests++;
+			stats.successes++;
 			const features = data.features || [];
 			if(features.length >= SEARCH_LIMIT) {
 				if(depth < MAX_SPLIT_DEPTH) {
-					await Promise.all(splitBbox(area).map(sub => searchArea(sub, depth + 1)));
+					const subs = splitBbox(area).filter(sub => rectIntersectsGeometry(sub, contour));
+					await Promise.all(subs.map(sub => searchArea(sub, depth + 1, errorDepth)));
 					return;
 				}
 				stats.truncated = true;
 			}
 			for(const f of features) { found.set(f.id, f); }
-			onProgress(found.size, stats.requests);
+			progress();
 		}
 
-		await searchArea(bbox, 0);
+		const cells = gridCells(geometryBbox(contour), INITIAL_CELL_SIZE_DEG, contour);
+		stats.cells = cells.length;
+		try {
+			await Promise.all(cells.map(cell => searchArea(cell, 0, 0)));
+		}
+		catch(err) {
+			throw serverDown ? stats.lastError : err;
+		}
+
+		if(stats.successes === 0 && stats.lastError) {
+			// Nothing worked at all: report the server error
+			throw stats.lastError;
+		}
 		return { features: [...found.values()], stats };
 	}
 
@@ -463,9 +573,10 @@
 
 		try {
 			const filter = buildCqlFilter(tag);
-			const bbox = geometryBbox(commune.contour);
-			const { features, stats } = await searchPictures(apiBase, bbox, filter, controller.signal, (n, r) => {
-				setStatus(`Recherche des images dans ${commune.nom}… ${n} image(s) taguée(s) trouvée(s) (${r} requête(s))`);
+			const { features, stats } = await searchPictures(apiBase, commune.contour, filter, controller.signal, (n, s) => {
+				let msg = `Recherche des images dans ${commune.nom}… ${n} image(s) taguée(s) trouvée(s) (${s.requests} requête(s)`;
+				if(s.errorSplits) { msg += `, ${s.errorSplits} zone(s) redécoupée(s) après une erreur du serveur`; }
+				setStatus(msg + ")");
 			});
 
 			let outside = 0, withZone = 0;
@@ -493,7 +604,12 @@
 			if(stats.truncated) {
 				msg += " Attention : zone très dense, certains résultats ont pu être tronqués.";
 			}
-			setStatus(msg, stats.truncated ? "warn" : "");
+			if(stats.failedAreas) {
+				msg += ` Attention : ${stats.failedAreas} petite(s) zone(s) n'ont pas pu être interrogées`
+					+ ` (${stats.lastError?.status ? `HTTP ${stats.lastError.status}` : "erreur réseau"}),`
+					+ " la liste peut être incomplète. Relancez la recherche plus tard pour les récupérer.";
+			}
+			setStatus(msg, stats.truncated || stats.failedAreas ? "warn" : "");
 			renderTasks();
 			resultsEl.hidden = false;
 		}
