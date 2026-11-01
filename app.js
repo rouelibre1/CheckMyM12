@@ -54,7 +54,7 @@
 	// ---------------------------------------------------------------------------------------------
 	// State
 	// ---------------------------------------------------------------------------------------------
-	let selectedCommune = null; // { nom, code, codesPostaux, departement, contour }
+	let selectedCommune = null; // selected area: { type: "commune"|"epci", nom, code, contour, … }
 	let tasks = [];
 	let currentSearch = null; // AbortController of the running search
 	let lastSearchTag = null; // { key, values } used for the displayed results
@@ -264,12 +264,16 @@
 	}
 
 	// ---------------------------------------------------------------------------------------------
-	// Commune search (geo.api.gouv.fr)
+	// Commune / EPCI search (geo.api.gouv.fr)
 	// ---------------------------------------------------------------------------------------------
 	const COMMUNE_FIELDS = "nom,code,codesPostaux,departement";
-	// Fallback when geo.api.gouv.fr is down or too slow: IGN Géoplateforme WFS (BD TOPO communes)
+	const EPCI_FIELDS = "nom,code,codesDepartements";
+	const MAX_COMMUNE_SUGGESTIONS = 8;
+	const MAX_EPCI_SUGGESTIONS = 4;
+	// Fallback when geo.api.gouv.fr is down or too slow: IGN Géoplateforme WFS (BD TOPO communes and EPCI)
 	const IGN_WFS = "https://data.geopf.fr/wfs/ows";
 	const IGN_COMMUNES_LAYER = "BDTOPO_V3:commune";
+	const IGN_EPCI_LAYER = "BDTOPO_V3:epci";
 	const GEO_API_TIMEOUT_MS = 8000;
 	const IGN_TIMEOUT_MS = 30000;
 	let geoApiDown = false; // once geo.api.gouv.fr failed, go straight to IGN for the rest of the session
@@ -290,28 +294,47 @@
 	}
 
 	const isCommuneCode = q => /^\d[\dAB]\d{3}$/i.test(q);
+	const isSiren = q => /^\d{9}$/.test(q);
 
-	async function searchCommunesGeoApi(q) {
-		const get = url => fetchJsonWithTimeout(url, GEO_API_TIMEOUT_MS);
-		if(isCommuneCode(q)) {
-			// 5 chars: either a postal code or an INSEE code
-			const [byPostal, byInsee] = await Promise.allSettled([
-				get(`${GEO_API}/communes?codePostal=${encodeURIComponent(q)}&fields=${COMMUNE_FIELDS}`),
-				get(`${GEO_API}/communes?code=${encodeURIComponent(q.toUpperCase())}&fields=${COMMUNE_FIELDS}`),
-			]);
-			if(byPostal.status === "rejected" && byInsee.status === "rejected") { throw byInsee.reason; }
-			const seen = new Set();
-			return [...(byInsee.value || []), ...(byPostal.value || [])].filter(c => !seen.has(c.code) && seen.add(c.code));
-		}
-		return get(`${GEO_API}/communes?nom=${encodeURIComponent(q)}&fields=${COMMUNE_FIELDS}&boost=population&limit=10`);
+	const geoCommune = c => ({ ...c, type: "commune" });
+	const geoEpci = e => ({ type: "epci", nom: e.nom, code: e.code, departements: e.codesDepartements || [], contour: e.contour });
+
+	/** Runs searches in parallel, keeps successful ones, fails only if all failed */
+	async function settledConcat(promises) {
+		const results = await Promise.allSettled(promises);
+		const ok = results.filter(r => r.status === "fulfilled");
+		if(!ok.length) { throw results[0].reason; }
+		const seen = new Set();
+		return ok.flatMap(r => r.value).filter(a => !seen.has(a.type + a.code) && seen.add(a.type + a.code));
 	}
 
-	function ignWfsUrl(params) {
+	async function searchAreasGeoApi(q) {
+		const get = url => fetchJsonWithTimeout(url, GEO_API_TIMEOUT_MS);
+		const enc = encodeURIComponent;
+		if(isCommuneCode(q)) {
+			// 5 chars: either a postal code or an INSEE code
+			return settledConcat([
+				get(`${GEO_API}/communes?code=${enc(q.toUpperCase())}&fields=${COMMUNE_FIELDS}`).then(l => l.map(geoCommune)),
+				get(`${GEO_API}/communes?codePostal=${enc(q)}&fields=${COMMUNE_FIELDS}`).then(l => l.map(geoCommune)),
+			]);
+		}
+		if(isSiren(q)) {
+			return settledConcat([
+				get(`${GEO_API}/epcis/${enc(q)}?fields=${EPCI_FIELDS}`).then(e => [geoEpci(e)], err => (err.status === 404 ? [] : Promise.reject(err))),
+			]);
+		}
+		return settledConcat([
+			get(`${GEO_API}/communes?nom=${enc(q)}&fields=${COMMUNE_FIELDS}&boost=population&limit=${MAX_COMMUNE_SUGGESTIONS}`).then(l => l.map(geoCommune)),
+			get(`${GEO_API}/epcis?nom=${enc(q)}&fields=${EPCI_FIELDS}`).then(l => l.slice(0, MAX_EPCI_SUGGESTIONS).map(geoEpci)),
+		]);
+	}
+
+	function ignWfsUrl(layer, params) {
 		return `${IGN_WFS}?${new URLSearchParams({
 			service: "WFS",
 			version: "2.0.0",
 			request: "GetFeature",
-			typeNames: IGN_COMMUNES_LAYER,
+			typeNames: layer,
 			outputFormat: "application/json",
 			srsName: "EPSG:4326",
 			...params,
@@ -334,6 +357,7 @@
 	function ignFeatureToCommune(f) {
 		const p = f.properties || {};
 		return {
+			type: "commune",
 			nom: p.nom_officiel,
 			code: p.code_insee,
 			codesPostaux: [],
@@ -342,21 +366,48 @@
 		};
 	}
 
-	async function searchCommunesIgn(q) {
-		const filter = isCommuneCode(q) ? `code_insee=${cqlQuote(q.toUpperCase())}` : `nom_officiel ILIKE ${cqlQuote(`${q}%`)}`;
-		const data = await fetchJsonWithTimeout(ignWfsUrl({
-			CQL_FILTER: filter,
-			count: "10",
-			propertyName: "nom_officiel,code_insee,code_insee_du_departement",
-		}), IGN_TIMEOUT_MS);
-		return (data.features || []).map(ignFeatureToCommune);
+	function ignFeatureToEpci(f) {
+		const p = f.properties || {};
+		return {
+			type: "epci",
+			nom: p.nom_officiel,
+			code: p.code_siren,
+			departements: (p.codes_insee_des_departements_membres || "").split(/[^\dAB]+/i).filter(Boolean),
+			contour: f.geometry ? lonLatGeometry(f.geometry) : undefined,
+		};
 	}
 
-	async function loadCommuneIgn(code) {
-		const data = await fetchJsonWithTimeout(ignWfsUrl({ CQL_FILTER: `code_insee=${cqlQuote(code)}`, count: "1" }), IGN_TIMEOUT_MS);
-		const feature = (data.features || [])[0];
-		if(!feature) { throw new Error(`commune ${code} introuvable`); }
-		return ignFeatureToCommune(feature);
+	const IGN_COMMUNE_PROPS = "nom_officiel,code_insee,code_insee_du_departement";
+	const IGN_EPCI_PROPS = "nom_officiel,code_siren,codes_insee_des_departements_membres";
+
+	async function ignSearch(layer, filter, count, propertyName, toArea) {
+		const params = { CQL_FILTER: filter, count: String(count) };
+		if(propertyName) { params.propertyName = propertyName; }
+		const data = await fetchJsonWithTimeout(ignWfsUrl(layer, params), IGN_TIMEOUT_MS);
+		return (data.features || []).map(toArea);
+	}
+
+	async function searchAreasIgn(q) {
+		if(isCommuneCode(q)) {
+			return ignSearch(IGN_COMMUNES_LAYER, `code_insee=${cqlQuote(q.toUpperCase())}`, 10, IGN_COMMUNE_PROPS, ignFeatureToCommune);
+		}
+		if(isSiren(q)) {
+			return ignSearch(IGN_EPCI_LAYER, `code_siren=${cqlQuote(q)}`, 1, IGN_EPCI_PROPS, ignFeatureToEpci);
+		}
+		return settledConcat([
+			ignSearch(IGN_COMMUNES_LAYER, `nom_officiel ILIKE ${cqlQuote(`${q}%`)}`, MAX_COMMUNE_SUGGESTIONS, IGN_COMMUNE_PROPS, ignFeatureToCommune),
+			// EPCI names often contain the main city name ("Eurométropole de Strasbourg"): match anywhere
+			ignSearch(IGN_EPCI_LAYER, `nom_officiel ILIKE ${cqlQuote(`%${q}%`)}`, MAX_EPCI_SUGGESTIONS, IGN_EPCI_PROPS, ignFeatureToEpci),
+		]);
+	}
+
+	async function loadAreaIgn(type, code) {
+		const [layer, filter, toArea] = type === "epci"
+			? [IGN_EPCI_LAYER, `code_siren=${cqlQuote(code)}`, ignFeatureToEpci]
+			: [IGN_COMMUNES_LAYER, `code_insee=${cqlQuote(code)}`, ignFeatureToCommune];
+		const [area] = await ignSearch(layer, filter, 1, null, toArea);
+		if(!area) { throw new Error(`${type === "epci" ? "EPCI" : "commune"} ${code} introuvable`); }
+		return area;
 	}
 
 	/** Tries geo.api.gouv.fr first, then IGN Géoplateforme if it fails */
@@ -374,41 +425,53 @@
 		return fromIgn();
 	}
 
-	async function searchCommunes(query) {
+	/** Searches communes and EPCI matching the query (name, postal code, INSEE code or SIREN) */
+	async function searchAreas(query) {
 		const q = query.trim();
 		if(q.length < 2) { return []; }
-		return withCommuneFallback(() => searchCommunesGeoApi(q), () => searchCommunesIgn(q));
+		return withCommuneFallback(() => searchAreasGeoApi(q), () => searchAreasIgn(q));
 	}
 
-	async function loadCommune(code) {
+	async function loadArea(type, code) {
+		const enc = encodeURIComponent(code);
 		return withCommuneFallback(
-			() => fetchJsonWithTimeout(`${GEO_API}/communes/${encodeURIComponent(code)}?fields=${COMMUNE_FIELDS},contour`, GEO_API_TIMEOUT_MS),
-			() => loadCommuneIgn(code)
+			() => type === "epci"
+				? fetchJsonWithTimeout(`${GEO_API}/epcis/${enc}?fields=${EPCI_FIELDS},contour`, GEO_API_TIMEOUT_MS).then(geoEpci)
+				: fetchJsonWithTimeout(`${GEO_API}/communes/${enc}?fields=${COMMUNE_FIELDS},contour`, GEO_API_TIMEOUT_MS).then(geoCommune),
+			() => loadAreaIgn(type, code)
 		);
 	}
 
-	function communeLabel(c) {
-		const d = c.departement;
+	function areaLabel(a) {
+		if(a.type === "epci") {
+			const deps = a.departements?.length ? ` (dép. ${a.departements.join(", ")})` : "";
+			return `${a.nom} – EPCI${deps}`;
+		}
+		const d = a.departement;
 		const dep = d ? (d.nom ? `${d.nom} (${d.code})` : `dép. ${d.code}`) : "";
-		return `${c.nom}${dep ? ` – ${dep}` : ""}`;
+		return `${a.nom}${dep ? ` – ${dep}` : ""}`;
+	}
+
+	function areaCode(a) {
+		return a.type === "epci" ? `SIREN ${a.code}` : `INSEE ${a.code}`;
 	}
 
 	let suggestionItems = [];
 	let activeSuggestion = -1;
 
-	function renderSuggestions(communes) {
-		suggestionItems = communes;
+	function renderSuggestions(areas) {
+		suggestionItems = areas;
 		activeSuggestion = -1;
 		communeSuggestions.replaceChildren();
-		if(!communes.length) {
+		if(!areas.length) {
 			communeSuggestions.hidden = true;
 			return;
 		}
-		communes.forEach((c, i) => {
+		areas.forEach((c, i) => {
 			const li = document.createElement("li");
-			li.textContent = communeLabel(c) + " ";
+			li.textContent = areaLabel(c) + " ";
 			const small = document.createElement("small");
-			small.textContent = `INSEE ${c.code}${c.codesPostaux?.length ? ` · CP ${c.codesPostaux.join(", ")}` : ""}`;
+			small.textContent = `${areaCode(c)}${c.codesPostaux?.length ? ` · CP ${c.codesPostaux.join(", ")}` : ""}`;
 			li.appendChild(small);
 			li.addEventListener("mousedown", e => {
 				e.preventDefault();
@@ -429,21 +492,22 @@
 		communeSuggestions.hidden = true;
 		if(!c) { return; }
 		communeInput.value = c.nom;
-		await selectCommune(c.code);
+		await selectArea(c.type, c.code);
 	}
 
-	async function selectCommune(code) {
+	async function selectArea(type, code) {
+		const what = type === "epci" ? "de l'EPCI" : "de la commune";
 		selectedCommune = null;
-		communeSelected.textContent = "Chargement du contour de la commune…";
+		communeSelected.textContent = `Chargement du contour ${what}…`;
 		try {
-			const c = await loadCommune(code);
+			const c = await loadArea(type, code);
 			if(!c.contour) { throw new Error("contour indisponible"); }
 			selectedCommune = c;
 			communeInput.value = c.nom;
-			communeSelected.textContent = `${communeLabel(c)} · INSEE ${c.code}`;
+			communeSelected.textContent = `${areaLabel(c)} · ${areaCode(c)}`;
 		}
 		catch(err) {
-			communeSelected.textContent = `Impossible de charger la commune : ${err.message}`;
+			communeSelected.textContent = `Impossible de charger le contour ${what} : ${err.message}`;
 		}
 		return selectedCommune;
 	}
@@ -451,7 +515,7 @@
 	const onCommuneInput = debounce(async () => {
 		const q = communeInput.value;
 		try {
-			renderSuggestions(await searchCommunes(q));
+			renderSuggestions(await searchAreas(q));
 		}
 		catch(err) {
 			renderSuggestions([]);
@@ -660,13 +724,13 @@
 			return;
 		}
 		if(!selectedCommune) {
-			const first = await searchCommunes(communeInput.value).catch(() => []);
+			const first = await searchAreas(communeInput.value).catch(() => []);
 			if(first.length === 1 || (first[0] && first[0].nom.toLowerCase() === communeInput.value.trim().toLowerCase())) {
-				await selectCommune(first[0].code);
+				await selectArea(first[0].type, first[0].code);
 			}
 		}
 		if(!selectedCommune) {
-			setStatus("Choisissez une commune dans la liste de suggestions.", "error");
+			setStatus("Choisissez une commune ou un EPCI dans la liste de suggestions.", "error");
 			return;
 		}
 
@@ -708,7 +772,7 @@
 			lastSearchTag = tag;
 
 			let msg = `${commune.nom} : ${tasks.length} image(s) avec le tag sans zone`;
-			msg += ` (${withZone} image(s) ont déjà une zone, ${outside} hors de la commune ignorée(s)).`;
+			msg += ` (${withZone} image(s) ont déjà une zone, ${outside} hors ${commune.type === "epci" ? "de l'EPCI" : "de la commune"} ignorée(s)).`;
 			if(stats.truncated) {
 				msg += " Attention : zone très dense, certains résultats ont pu être tronqués.";
 			}
@@ -896,7 +960,7 @@
 	// ---------------------------------------------------------------------------------------------
 	function updateUrl(commune, tag) {
 		const params = new URLSearchParams();
-		params.set("commune", commune.code);
+		params.set(commune.type === "epci" ? "epci" : "commune", commune.code);
 		params.set("source", getSourceApi());
 		if(tag.key !== "osm|traffic_sign") { params.set("key", tag.key); }
 		if(tag.values.join(",") !== "FR:M12") { params.set("values", tag.values.join(",")); }
@@ -917,8 +981,8 @@
 		}
 		if(params.get("key")) { tagKeyInput.value = params.get("key"); }
 		if(params.get("values")) { tagValuesInput.value = params.get("values"); }
-		const code = params.get("commune");
-		if(code && await selectCommune(code)) {
+		const [type, code] = params.get("epci") ? ["epci", params.get("epci")] : ["commune", params.get("commune")];
+		if(code && await selectArea(type, code)) {
 			runSearch();
 		}
 	}
